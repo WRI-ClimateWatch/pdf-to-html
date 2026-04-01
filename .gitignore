@@ -1,0 +1,17 @@
+# Local outputs / artifacts
+html/
+pdf/
+downloads/
+
+# Backups
+*.bak
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.venv/
+
+# macOS
+.DS_Store
