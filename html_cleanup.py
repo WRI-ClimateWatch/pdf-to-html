@@ -65,12 +65,18 @@ ALLOWED_TAGS = {
     "blockquote",
     "strong",
     "em",
+    "sup",
+    "sub",
 }
 
 
 ALLOWED_ATTRS: Dict[str, set[str]] = {
     "meta": {"charset", "content", "name"},
-    "a": {"href"},
+    # Keep Word footnote anchors like:
+    #   <a name="_ftnref1" id="_ftnref1" href="#_ftn1"><sup>1</sup></a>
+    # and footnote definition targets like:
+    #   <a name="_ftn1" id="_ftn1" href="#_ftnref1">[1]</a>
+    "a": {"href", "id", "name"},
     "img": {"src", "alt", "width", "height"},
     "td": {"colspan", "rowspan"},
     "th": {"colspan", "rowspan"},
@@ -97,6 +103,9 @@ _RE_NUMBERED = re.compile(r"^\s*(\d+(?:\.\d+)*)(\.)?\s*(\S.*\S|\S)\s*$")
 _RE_PAGE_NUM = re.compile(r"^\s*(\d+|[ivxlcdm]+)\s*$", re.IGNORECASE)
 
 HEADING_TAGS = {"h1", "h2", "h3", "h4", "h5", "h6"}
+
+_RE_FTN_REF = re.compile(r"^_(?:ftn|edn)ref(\d+)$", re.IGNORECASE)
+_RE_FTN_DEF = re.compile(r"^_(?:ftn|edn)(\d+)$", re.IGNORECASE)
 
 
 def _safe_stem(value: str) -> str:
@@ -546,6 +555,172 @@ def _strip_empty_formatting(root) -> bool:
         parent.remove(el)
         changed = True
     return changed
+
+
+def normalize_word_footnotes(root) -> bool:
+    """
+    Normalize Word-style footnotes into:
+      - superscript anchor refs in-text (preserved)
+      - a single ordered list of footnotes at the end of <body>
+
+    This is intentionally conservative:
+    - Only hoists footnote definition paragraphs that are *direct children* of <body>
+      and contain an <a name/id="_ftnN" ...> (or endnote variants).
+    - Leaves any nested definitions (e.g., inside tables) untouched.
+    """
+    import xml.etree.ElementTree as ET
+
+    body = root.find(".//body")
+    if body is None:
+        body = root
+
+    changed = False
+
+    def _ensure_anchor_ids(a: ET.Element, key: str) -> None:
+        nonlocal changed
+        if not a.attrib.get("id"):
+            a.attrib["id"] = key
+            changed = True
+        if not a.attrib.get("name"):
+            a.attrib["name"] = key
+            changed = True
+
+    def _parse_href_num(href: str) -> Optional[Tuple[str, str]]:
+        # Returns ("ftn"|"edn", "N") for #_ftnN, #_ednN, #_ftnrefN, #_ednrefN
+        href = href.strip()
+        if not href.startswith("#_"):
+            return None
+        frag = href[1:]  # keep leading _
+        m = _RE_FTN_REF.match(frag)
+        if m:
+            # frag looks like _ftnrefN / _ednrefN
+            kind = "edn" if frag.lower().startswith("_edn") else "ftn"
+            return kind, m.group(1)
+        m = _RE_FTN_DEF.match(frag)
+        if m:
+            kind = "edn" if frag.lower().startswith("_edn") else "ftn"
+            return kind, m.group(1)
+        return None
+
+    def _make_sup(num: str) -> ET.Element:
+        sup = ET.Element("sup")
+        sup.text = num
+        return sup
+
+    # Normalize in-text references:
+    #   <a href="#_ftn1">[1]</a>  ->  <a href="#_ftn1" id/name="_ftnref1"><sup>1</sup></a>
+    for a in root.findall(".//a"):
+        href = (a.attrib.get("href") or "").strip()
+        parsed = _parse_href_num(href)
+        if not parsed:
+            continue
+        kind, num = parsed
+        # Only treat href="#_ftnN"/"#_ednN" as references (not the backlinks).
+        if href.lower().startswith(f"#_{kind}ref"):
+            continue
+        ref_key = f"_{kind}ref{num}"
+        _ensure_anchor_ids(a, ref_key)
+
+        # If the anchor has no <sup>, and its visible text looks like [N] or N, wrap it.
+        has_sup = any((c.tag or "").lower() == "sup" for c in list(a))
+        if not has_sup:
+            visible = _norm_text("".join(a.itertext()))
+            if visible in {num, f"[{num}]"}:
+                a.clear()
+                a.tag = "a"
+                a.attrib["href"] = f"#_{kind}{num}"
+                a.attrib["id"] = ref_key
+                a.attrib["name"] = ref_key
+                a.append(_make_sup(num))
+                changed = True
+
+    defs: List[Tuple[str, Optional[str], ET.Element]] = []
+    for ch in list(body):
+        if (ch.tag or "").lower() != "p":
+            continue
+        anchors = list(ch.findall(".//a"))
+        if not anchors:
+            continue
+
+        def_id: Optional[str] = None
+        back_href: Optional[str] = None
+
+        # Pattern A: Word-style definition with explicit name/id.
+        for a in anchors:
+            key = (a.attrib.get("name") or a.attrib.get("id") or "").strip()
+            if not key:
+                continue
+            if _RE_FTN_DEF.match(key):
+                def_id = key
+                back_href = (a.attrib.get("href") or "").strip() or None
+                _ensure_anchor_ids(a, key)
+                break
+
+        # Pattern B: Washed definition like <p><a href="#_ftnrefN">[N]</a> ...</p>
+        if def_id is None:
+            first_a = anchors[0]
+            href = (first_a.attrib.get("href") or "").strip()
+            parsed = _parse_href_num(href)
+            if parsed and href.lower().startswith(f"#_{parsed[0]}ref"):
+                kind, num = parsed
+                def_id = f"_{kind}{num}"
+                back_href = f"#_{kind}ref{num}"
+
+        if not def_id:
+            continue
+
+        defs.append((def_id, back_href, ch))
+        body.remove(ch)
+        changed = True
+
+    if not defs:
+        return changed
+
+    # Append footnotes list at end of body.
+    body.append(ET.Element("hr"))
+    ol = ET.Element("ol")
+    for def_id, back_href, p in defs:
+        li = ET.Element("li")
+
+        # Add an explicit target anchor so #_ftnN always lands correctly.
+        target = ET.SubElement(li, "a")
+        target.attrib["id"] = def_id
+        target.attrib["name"] = def_id
+        target.text = ""
+
+        # Move paragraph contents into the list item, dropping the leading marker anchor if present.
+        # Common Word pattern:
+        #   <p><a name="_ftn1" href="#_ftnref1">[1]</a> Footnote text...</p>
+        if p.text:
+            # Usually empty, but keep if present.
+            target.tail = (target.tail or "") + p.text
+            p.text = None
+
+        for node in list(p):
+            if (node.tag or "").lower() == "a":
+                node_key = (node.attrib.get("name") or node.attrib.get("id") or "").strip()
+                node_href = (node.attrib.get("href") or "").strip()
+                # Drop the leading marker anchor:
+                # - Word-style: <a name/id="_ftnN" ...>[N]</a>
+                # - Washed-style: <a href="#_ftnrefN">[N]</a>
+                if node_key.lower() == def_id.lower() or (back_href and node_href == back_href):
+                    if node.tail:
+                        target.tail = (target.tail or "") + node.tail
+                    p.remove(node)
+                    continue
+            p.remove(node)
+            li.append(node)
+
+        # Optional backlink (only if Word provided one).
+        if back_href and back_href.startswith("#"):
+            back = ET.SubElement(li, "a")
+            back.attrib["href"] = back_href
+            back.text = "↩"
+
+        ol.append(li)
+
+    body.append(ol)
+    return True
 
 
 def _find_chapter_boundary(body, chapter_num: int) -> Optional[int]:
@@ -1134,6 +1309,8 @@ def cleanup_file(path: pathlib.Path, *, options: CleanupOptions, backup: bool) -
         nonlocal changed, warnings
         if demote_headings_in_tables(scope_root):
             changed = True
+        if normalize_word_footnotes(scope_root):
+            changed = True
         if options.merge_tables:
             if merge_adjacent_tables(scope_root):
                 changed = True
@@ -1242,7 +1419,9 @@ def _iter_html_files(paths: Iterable[pathlib.Path]) -> List[pathlib.Path]:
 
 
 def cli() -> argparse.Namespace:
-    ap = argparse.ArgumentParser(description="Wash HTML and normalize images into ./img/")
+    ap = argparse.ArgumentParser(
+        description="Wash HTML and normalize images into an ./img/ folder next to the processed HTML file(s)"
+    )
     ap.add_argument("paths", nargs="+", help="HTML file(s) or directory(ies) containing HTML")
     ap.add_argument("--no-backup", action="store_true", help="Do not write .bak backups")
     ap.add_argument("--no-images", action="store_true", help="Do not rewrite/copy images into ./img/")
