@@ -207,8 +207,9 @@ class Washer(HTMLParser):
         if tag not in ALLOWED_TAGS:
             return
         if tag == "meta":
-            # keep only charset meta (and a very small meta subset)
-            pass
+            name_val = next((v for k, v in attrs if k == "name"), "").lower()
+            if name_val in {"progid", "generator", "originator"}:
+                return
         attr_txt = ""
         if attrs:
             parts = [f'{k}="{html.escape(v, quote=True)}"' for k, v in attrs]
@@ -626,12 +627,14 @@ def normalize_word_footnotes(root) -> bool:
         if not has_sup:
             visible = _norm_text("".join(a.itertext()))
             if visible in {num, f"[{num}]"}:
+                saved_tail = a.tail
                 a.clear()
                 a.tag = "a"
                 a.attrib["href"] = f"#_{kind}{num}"
                 a.attrib["id"] = ref_key
                 a.attrib["name"] = ref_key
                 a.append(_make_sup(num))
+                a.tail = saved_tail
                 changed = True
 
     defs: List[Tuple[str, Optional[str], ET.Element]] = []
@@ -1281,6 +1284,22 @@ def _strip_illegal_xml_chars(text: str) -> str:
     return "".join(out_chars)
 
 
+_TABLE_STYLE = (
+    "table{border-collapse:collapse}"
+    "td,th{border:1px solid #ccc;padding:4px}"
+)
+
+
+def _inject_table_style(root) -> None:
+    import xml.etree.ElementTree as ET
+
+    head = root.find(".//head")
+    if head is None:
+        head = ET.SubElement(root, "head")
+    style = ET.SubElement(head, "style")
+    style.text = _TABLE_STYLE
+
+
 def cleanup_file(path: pathlib.Path, *, options: CleanupOptions, backup: bool) -> List[str]:
     html_text = _read_text_guess_encoding(path)
 
@@ -1377,8 +1396,8 @@ def cleanup_file(path: pathlib.Path, *, options: CleanupOptions, backup: bool) -
         _apply_full_transforms(root)
         _apply_images(root)
 
-    if not changed:
-        return warnings
+    _inject_table_style(root)
+    changed = True
 
     out_html = _serialize_xml(root)
     if backup:
